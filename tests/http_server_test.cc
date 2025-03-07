@@ -843,6 +843,66 @@ TEST(http_server_test, response_size_captured)
 
     } // end encapsulate
 
+
+// New test case for issue #759
+std::atomic<bool> global_var(false);
+
+struct VarModifyHandler : public Pistache::Http::Handler {
+    HTTP_PROTOTYPE(VarModifyHandler)
+
+    VarModifyHandler() {}
+
+    void onRequest(const Pistache::Http::Request& /*request*/,
+                   Pistache::Http::ResponseWriter writer) override {
+        std::string resultData("I'm going to modify a variable");
+        std::cout << "[server] Sent: " << resultData << std::endl;
+        auto res = writer.send(Pistache::Http::Code::Ok, resultData);
+        res.then([](ssize_t /*bytes*/) {
+            std::cout << "Promise: modifying variable" << std::endl;
+            global_var = true;
+        }, Pistache::Async::NoExcept);
+    }
+};
+
+TEST(http_server_test, async_promise_called_after_send_response) {
+    const Pistache::Address address("localhost", Pistache::Port(0));
+
+    Pistache::Http::Endpoint server(address);
+    auto flags = Pistache::Tcp::Options::ReuseAddr;
+    auto server_opts = Pistache::Http::Endpoint::options().flags(flags);
+    server.init(server_opts);
+    server.setHandler(Pistache::Http::make_handler<VarModifyHandler>());
+    server.serveThreaded();
+
+    const std::string server_address = "localhost:" + server.getPort().toString();
+    std::cout << "Server address: " << server_address << "\n";
+
+    global_var = false;
+
+    Pistache::Http::Client client;
+    client.init();
+    auto rb = client.get(server_address);
+    auto response = rb.send();
+    std::string resultData;
+    response.then(
+        [&resultData](Pistache::Http::Response resp) {
+            std::cout << "Response data received: " << resp.body() << std::endl;
+            if (resp.code() == Pistache::Http::Code::Ok) {
+                resultData = resp.body();
+            }
+        },
+        Pistache::Async::Throw);
+
+    const int WAIT_TIME = 2;
+    Pistache::Async::Barrier<Pistache::Http::Response> barrier(response);
+    barrier.wait_for(std::chrono::seconds(WAIT_TIME));
+
+    client.shutdown();
+    server.shutdown();
+
+    ASSERT_EQ(global_var, true); // Verify promise resolved
+}
+
 #ifdef _USE_LIBEVENT_LIKE_APPLE
 #ifdef DEBUG
     const int em_event_count_after = EventMethFns::getEmEventCount();
